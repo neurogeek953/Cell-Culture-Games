@@ -8,5 +8,4 @@ Enjoy! Please give me some feedback!
 Regards,
 neurogeek953
 
-
-Acknowledgement: The temperature 2 spike model was based on data provided by Konstantin Nikolic.
+Acknowledgement: The temperature 2 spike model was based on data provided by Doctor Konstantin Nikolic at Imperial College London.
