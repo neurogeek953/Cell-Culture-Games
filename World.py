@@ -58,7 +58,8 @@ class Object:
                  position_x,
                  position_y,
                  position_z,
-                 initial_temperature):
+                 initial_temperature,
+                 mass):
         
         self.Temperature = initial_temperature
         self.XPosition = position_x
@@ -67,6 +68,7 @@ class Object:
         self.Distance2Origin = 0
         self.Distances = {}
         self.Label = None
+        self.Mass = mass
     
     def label_object(self, label):
         
@@ -83,13 +85,15 @@ class World(Time):
                  width,
                  height,
                  conduction = 0.024,
-                 absorption = 0.85):
+                 absorption = 0.005,
+                 cooling_time_constant = 1):
         
         self.TimeObject = Time()
         self.Clock = self.TimeObject.Clock
         self.Timestep = self.TimeObject.Timestep
         self.Temperature = initial_temperature
         self.HeatAbsorption = absorption # Peltier effect
+        self.CoolingTimeConstant = cooling_time_constant 
         self.TimeInstance = 0
         self.Height = height
         self.Width = width
@@ -143,7 +147,7 @@ class World(Time):
         self.HPConserved = []
         
         # Probability
-        self.ActivationProbability = []
+        self.ActivationProbability = [] # The activation probability or heater power increase probability are one aspect of the cell culture's strategy
         self.CorrectActivationProbability = []
         self.CorrectDeactivationProbability = []
         self.CorrectProbability = []
@@ -164,6 +168,9 @@ class World(Time):
         self.OnDNC_FR_F = []
         self.OffDNC_FR_F = []
         self.DNC_FR_F = []
+        
+        # Strategy Aspects
+        self.LT_P_Aspect = []
          
     def distance_2_origin(self, obj):
         
@@ -270,7 +277,7 @@ class World(Time):
             print('There are', self.NumberOfCellCultures, "cell culultures in the environment")
             print('The cell culultures present in the environment are:',  self.CellCultures)        
     
-    def update(self, cell_culture, heater, t, hset):
+    def update(self, cell_culture, heater, t, hset, nb_activations):
         
         # Note this function must run with a nengo simulator (nengo.Simulator)
         # It works as well with a nengo_dl.Simulator but I opted for the previous option to maintain the biological dynamics as much as possible
@@ -281,26 +288,6 @@ class World(Time):
         
         self.Temperatures.append(self.Temperature)
         heater.heat()
-        d = cell_culture.Distances[cell_culture.Label + '-' + heater.Label]
-        
-        ### HEAT Absorption by environment
-        cell_culture.Temperature = cell_culture.Temperature +  heater.Temperature * d / self.HeatConductance 
-        
-        # Residue heat (heat unabsorbed by the cell culture)
-        residue_heat = self.HeatAbsorption * heater.Temperature * d / self.HeatConductance
-        
-        # Heat Transfer
-        if self.Temperature <= cell_culture.Temperature:
-            
-            self.Temperature = self.Temperature + residue_heat / 2 - 0.00025 * d / self.HeatConductance + hset.execute_hazards(time = self.Clock)
-            cell_culture.Temperature = cell_culture.Temperature - residue_heat / 2 - 0.0001875 * d / self.HeatConductance + hset.execute_hazards(time = self.Clock)
-            
-        if self.Temperature >= cell_culture.Temperature:
-            
-            self.Temperature = self.Temperature - residue_heat / 2 - 0.00025 * d / self.HeatConductance + hset.execute_hazards(time = self.Clock)
-            cell_culture.Temperature = cell_culture.Temperature + residue_heat / 2 - 0.0001875 * d / self.HeatConductance + hset.execute_hazards(time = self.Clock)
-        
-        hset.track_next_hazard(time = self.Clock)
         
         # Stimulate the network
         cell_culture.simulate_one_NeuralNetwork_time_instance(cell_culture.Temperature, self.Clock, self.Timestep)
@@ -404,6 +391,12 @@ class World(Time):
                 
                 heater.decrease_power()
         
+        ### HEAT Dynamics
+        cell_culture.Temperature = cell_culture.Temperature +  cell_culture.Mass * cell_culture.HeatCapacity * heater.Temperature + hset.execute_hazards(self.Clock)
+        cell_culture.Temperature = cell_culture.Temperature - abs(cell_culture.Temperatures[-1] - cell_culture.Temperature) * np.exp(- self.Timestep / self.CoolingTimeConstant) - self.HeatAbsorption
+        self.Temperature = self.Temperature + (self.Temperature - self.Temperatures[-1]) * np.exp(- self.Timestep / self.CoolingTimeConstant)
+        hset.track_next_hazard(self.Clock)
+        
         # update the clocks
         self.TimeObject.update_time()
         self.Clock = self.TimeObject.Clock
@@ -417,17 +410,50 @@ class World(Time):
         if heater.Kind == 'On/Off Switch Heater':
             
             check = heater.status
-
+            
+            if len(heater.Memory) == 1:
+                
+                if check > 0:
+                    
+                    # Compute Mean Activation period
+                    nb_activations = nb_activations + 1
+                    activation_time_span = sum(heater.Memory) * self.Timestep
+                    self.LT_P_Aspect.append(activation_time_span / nb_activations)
+                    
+                else:
+                    
+                    # if heater is not active at the first timestep append 0
+                    self.LT_P_Aspect.append(0)
+                
+            elif heater.Memory[t] - heater.Memory[t - 1] == 1:
+                
+                nb_activations = nb_activations + 1
+                
+                # Compute Mean Activation period
+                activation_time_span = sum(heater.Memory) * self.Timestep
+                self.LT_P_Aspect.append(activation_time_span / nb_activations)
+            
+            else :
+                
+                self.LT_P_Aspect.append(self.LT_P_Aspect[-1])
+            
+            
 
         if heater.Kind == 'Up/Down Switch Heater':
             
             if len(heater.Memory) == 1:
                 
                 check = heater.status
+                nb_activations = 1
                 
             else:
                 
                 check = heater.Memory[t] - heater.Memory[t - 1]
+            
+            # Compute Mean Power
+            self.LT_P_Aspect.append(np.mean(heater.Memory))
+            
+            
         
         if check > 0 and cell_culture.Temperature < 22:
             
@@ -455,6 +481,8 @@ class World(Time):
         else:
             
             self.HPConserved.append(0)
+        
+        
         
         # Probabilities           
         self.ActivationProbability.append((sum(heater.Memory) / len(heater.Memory)))
@@ -489,6 +517,14 @@ class World(Time):
             plt.xlabel('Time in Seconds [s]', {'fontsize': 18})
             plt.ylabel('Status [Binary]', {'fontsize': 18})
             plt.show()
+            
+            # mean heater activation period
+            plt.figure(figsize = (10, 6))
+            plt.plot(self.TimeInstances, self.LT_P_Aspect)
+            plt.title('Heater Status as a Function of Time', {'fontsize': 20})
+            plt.xlabel('Time in Seconds [s]', {'fontsize': 18})
+            plt.ylabel('Activation Period in Seconds [s]', {'fontsize': 18})
+            plt.show()
         
         if heater.Kind == 'Up/Down Switch Heater':
             
@@ -498,8 +534,15 @@ class World(Time):
             plt.xlabel('Time in Seconds [s]', {'fontsize': 18})
             plt.ylabel('Power in Watts [W]', {'fontsize': 18})
             plt.show()
-        
-        
+            
+            # mean heater power
+            plt.figure(figsize = (10, 6))
+            plt.plot(self.TimeInstances, self.LT_P_Aspect)
+            plt.title('Heater Status as a Function of Time', {'fontsize': 20})
+            plt.xlabel('Time in Seconds [s]', {'fontsize': 18})
+            plt.ylabel('Power in Watts [W]', {'fontsize': 18})
+            plt.show()
+            
         ## Plot world Temperature
         
         plt.figure(figsize = (10, 6))
@@ -616,16 +659,15 @@ class World(Time):
         
         # ANN
         fANN, tANN, SANN = spectrogram(np.array(self.ANN_FR), 1 / (5 * self.Timestep))
-        lfANN = np.log10(fANN[1:])
+        SANN = SANN / np.amax(SANN)
         maxANN = np.amax(SANN)
         minANN = np.amin(SANN)
-        maxANN = np.amax(SANN) / 250
-        tANN = 2 * tANN[1:] / 10
+        maxANN = np.amax(SANN) / 2000
+        tANN = 2 * tANN / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tANN, lfANN, SANN[1:, 1:], vmin = minANN, vmax = maxANN, cmap='coolwarm')
-        plt.yticks(lfANN[::20], np.around(fANN[1::20]))
+        plt.pcolormesh(tANN, fANN, SANN, vmin = minANN, vmax = maxANN, cmap='coolwarm')
         plt.title('ANN Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -635,16 +677,15 @@ class World(Time):
         
         # OnNC
         fOnNC, tOnNC, SOnNC = spectrogram(np.array(self.OnNC_FR), 1 / (5 * self.Timestep))
-        lfOnNC = np.log10(fOnNC[1:])
+        SOnNC = SOnNC / np.amax(SOnNC)
         maxOnNC = np.amax(SOnNC)
         minOnNC = np.amin(SOnNC)
-        maxOnNC = np.amax(SOnNC) / 31.25
-        tOnNC = 2 * tOnNC[1:] / 10
+        maxOnNC = np.amax(SOnNC) / 250
+        tOnNC = 2 * tOnNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOnNC, lfOnNC, SOnNC[1:, 1:], vmin = minOnNC, vmax = maxOnNC, cmap='coolwarm')
-        plt.yticks(lfOnNC[::20], np.around(fOnNC[1::20]))
+        plt.pcolormesh(tOnNC, fOnNC, SOnNC, vmin = minOnNC, vmax = maxOnNC, cmap='coolwarm')
         plt.title('On Neural Coalition Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -654,16 +695,15 @@ class World(Time):
         
         # OffNC
         fOffNC, tOffNC, SOffNC = spectrogram(np.array(self.OffNC_FR), 1 / (5 * self.Timestep))
-        lfOffNC = np.log10(fOffNC[1:])
+        SOffNC = SOffNC / np.amax(SOffNC)
         maxOffNC = np.amax(SOffNC)
         minOffNC = np.amin(SOffNC)
-        maxOffNC = np.amax(SOffNC) / 31.25
-        tOffNC = 2 * tOffNC[1:] / 10
+        maxOffNC = np.amax(SOffNC) / 250
+        tOffNC = 2 * tOffNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOffNC, lfOffNC, SOffNC[1:, 1:], vmin = minOffNC, vmax = maxOffNC, cmap='coolwarm')
-        plt.yticks(lfOffNC[::20], np.around(fOffNC[1::20]))
+        plt.pcolormesh(tOffNC, fOffNC, SOffNC, vmin = minOffNC, vmax = maxOffNC, cmap='coolwarm')
         plt.title('Off Neural Coalition Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -673,16 +713,15 @@ class World(Time):
         
         # OnDNC
         fOnDNC, tOnDNC, SOnDNC = spectrogram(np.array(self.OnDNC_FR), 1 / (5 * self.Timestep))
-        lfOnDNC = np.log10(fOnDNC[1:])
+        SOnDNC = SOnDNC / np.amax(SOnDNC)
         maxOnDNC = np.amax(SOnDNC)
         minOnDNC = np.amin(SOnDNC)
-        maxOnDNC = np.amax(SOnDNC) / 31.25
-        tOnDNC = 2 * tOnDNC[1:] / 10
+        maxOnDNC = np.amax(SOnDNC) / 250
+        tOnDNC = 2 * tOnDNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOnDNC, lfOnDNC, SOnDNC[1:, 1:], vmin = minOnDNC, vmax = maxOnDNC, cmap='coolwarm')
-        plt.yticks(lfOnDNC[::20], np.around(fOnDNC[1::20]))
+        plt.pcolormesh(tOnDNC, fOnDNC, SOnDNC, vmin = minOnDNC, vmax = maxOnDNC, cmap='coolwarm')
         plt.title('Decision Coalition Channel 1 Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -693,16 +732,15 @@ class World(Time):
         
         # OffDNC
         fOffDNC, tOffDNC, SOffDNC = spectrogram(np.array(self.OffDNC_FR), 1 / (5 * self.Timestep))
-        lfOffDNC = np.log10(fOffDNC[1:])
+        SOffDNC = SOffDNC / np.amax(SOffDNC)
         maxOffDNC = np.amax(SOffDNC)
         minOffDNC = np.amin(SOffDNC)
-        maxOffDNC = np.amax(SOffDNC) / 31.25
-        tOffDNC = 2 * tOffDNC[1:] / 10
+        maxOffDNC = np.amax(SOffDNC) / 250
+        tOffDNC = 2 * tOffDNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOffDNC, lfOffDNC, SOffDNC[1:, 1:], vmin = minOffDNC, vmax = maxOffDNC, cmap='coolwarm')
-        plt.yticks(lfOffDNC[::20], np.around(fOffDNC[1::20]))
+        plt.pcolormesh(tOffDNC, fOffDNC, SOffDNC, vmin = minOffDNC, vmax = maxOffDNC, cmap='coolwarm')
         plt.title('Decision Coalition Channel 2 Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -712,16 +750,15 @@ class World(Time):
         
         # DNC
         fDNC, tDNC, SDNC = spectrogram(np.array(self.DNC_FR), 1 / (5 * self.Timestep))
-        lfDNC = np.log10(fDNC[1:])
+        SDNC = SDNC / np.amax(SDNC)
         maxDNC = np.amax(SDNC)
         minDNC = np.amin(SDNC)
-        maxDNC = np.amax(SDNC) / 31.25
-        tDNC = 2 * tDNC[1:] / 10
+        maxDNC = np.amax(SDNC) / 250
+        tDNC = 2 * tDNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tDNC, lfDNC, SDNC[1:, 1:], vmin = minDNC, vmax = maxDNC, cmap='coolwarm')
-        plt.yticks(lfDNC[::20], np.around(fDNC[1::20]))
+        plt.pcolormesh(tDNC, fDNC, SDNC, vmin = minDNC, vmax = maxDNC, cmap='coolwarm')
         plt.title('Decision Coalition Channel 3 Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -731,16 +768,15 @@ class World(Time):
         
         # Decision
         fD, tD, SD = spectrogram(np.array(self.OnDNC_FR) + np.array(self.OffDNC_FR) + np.array(self.DNC_FR), 1 / (5 * self.Timestep))
-        lfD = np.log10(fD[1:])
+        SD = SD / np.amax(SD)
         maxD = np.amax(SD)
         minD = np.amin(SD)
-        maxD = np.amax(SD) / 250
-        tD = 2 * tD[1:] / 10
+        maxD = np.amax(SD) / 2000
+        tD = 2 * tD / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tD, lfD, SD[1:, 1:], vmin = minD, vmax = maxD, cmap='coolwarm')
-        plt.yticks(lfDNC[::20], np.around(fDNC[1::20]))
+        plt.pcolormesh(tD, fD, SD, vmin = minD, vmax = maxD, cmap='coolwarm')
         plt.title('Decision Coalition Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -750,16 +786,15 @@ class World(Time):
         
         # ENN
         fENN, tENN, SENN = spectrogram(np.array(self.ENN_FR), 1 / (5 * self.Timestep))
-        lfENN = np.log10(fENN[1:])
+        SENN = SENN / np.amax(SENN)
         maxENN = np.amax(SENN)
         minENN = np.amin(SENN)
-        maxENN = np.amax(SENN) / 31.25
-        tENN = 2 * tENN[1:] / 10
+        maxENN = np.amax(SENN) / 250
+        tENN = 2 * tENN / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tENN, lfENN, SENN[1:, 1:], vmin = minENN, vmax = maxENN, cmap='coolwarm')
-        plt.yticks(lfENN[::20], np.around(fENN[1::20]))
+        plt.pcolormesh(tENN, fENN, SENN, vmin = minENN, vmax = maxENN, cmap='coolwarm')
         plt.title('ENN Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -769,16 +804,15 @@ class World(Time):
         
         # Output
         fO, tO, SO = spectrogram(abs(np.array(self.OnNC_FR) - np.array(self.OffNC_FR)) + np.array(self.ENN_FR), 1 / (5 * self.Timestep))
-        lfO = np.log10(fO[1:])
+        SO = SO / np.amax(SO)
         maxO = np.amax(SO)
         minO = np.amin(SO)
-        maxO = np.amax(SO) / 250
-        tO = 2 * tO[1:] / 10
+        maxO = np.amax(SO) / 2000
+        tO = 2 * tO / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tO, lfO, SO[1:, 1:], vmin = minO, vmax = maxO, cmap='coolwarm')
-        plt.yticks(lfO[::20], np.around(fO[1::20]))
+        plt.pcolormesh(tO, fO, SO, vmin = minO, vmax = maxO, cmap='coolwarm')
         plt.title('Output Spectrogram for Fire Rate', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -790,16 +824,15 @@ class World(Time):
         
         # ANN
         fANN, tANN, SANN = spectrogram(np.reshape(cell_culture.NN_sim.data[cell_culture.InputProbe], np.size(cell_culture.NN_sim.data[cell_culture.InputProbe])), 1 / (5 * self.Timestep))
-        lfANN = np.log10(fANN[1:])
+        SANN = SANN / np.amax(SANN)
         maxANN = np.amax(SANN)
         minANN = np.amin(SANN)
         maxANN = np.amax(SANN) / 2000
-        tANN = 2 * tANN[1:] / 10
+        tANN = 2 * tANN / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tANN, lfANN, SANN[1:, 1:], vmin = minANN, vmax = maxANN, cmap='coolwarm')
-        plt.yticks(lfANN[::20], np.around(fANN[1::20]))
+        plt.pcolormesh(tANN, fANN, SANN, vmin = minANN, vmax = maxANN, cmap='coolwarm')
         plt.title('ANN Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -809,16 +842,15 @@ class World(Time):
         
         # OnNC
         fOnNC, tOnNC, SOnNC = spectrogram(np.reshape((cell_culture.NN_sim.data[cell_culture.OnProbe]), np.size(cell_culture.NN_sim.data[cell_culture.InputProbe])), 1 / (5 * self.Timestep))
-        lfOnNC = np.log10(fOnNC[1:])
+        SOnNC = SOnNC / np.amax(SOnNC)
         maxOnNC = np.amax(SOnNC)
         minOnNC = np.amin(SOnNC)
         maxOnNC = np.amax(SOnNC) / 250
-        tOnNC = 2 * tOnNC[1:] / 10
+        tOnNC = 2 * tOnNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOnNC, lfOnNC, SOnNC[1:, 1:], vmin = minOnNC, vmax = maxOnNC, cmap='coolwarm')
-        plt.yticks(lfOnNC[::20], np.around(fOnNC[1::20]))
+        plt.pcolormesh(tOnNC, fOnNC, SOnNC, vmin = minOnNC, vmax = maxOnNC, cmap='coolwarm')
         plt.title('On Neural Coalition Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -828,7 +860,7 @@ class World(Time):
         
         # OffNC
         fOffNC, tOffNC, SOffNC = spectrogram(np.reshape(cell_culture.NN_sim.data[cell_culture.OffProbe], np.size(cell_culture.NN_sim.data[cell_culture.OffProbe])), 1 / (5 * self.Timestep))
-        lfOffNC = np.log10(fOffNC[1:])
+        SOffNC = SOffNC / np.amax(SOffNC)
         maxOffNC = np.amax(SOffNC)
         minOffNC = np.amin(SOffNC)
         maxOffNC = np.amax(SOffNC) / 250
@@ -836,8 +868,7 @@ class World(Time):
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOffNC, lfOffNC, SOffNC[1:, 1:], vmin = minOffNC, vmax = maxOffNC, cmap='coolwarm')
-        plt.yticks(lfOffNC[::20], np.around(fOffNC[1::20]))
+        plt.pcolormesh(tOffNC, fOffNC, SOffNC, vmin = minOffNC, vmax = maxOffNC, cmap='coolwarm')
         plt.title('Off Neural Coalition Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -853,16 +884,15 @@ class World(Time):
         
         # OnDNC
         fOnDNC, tOnDNC, SOnDNC = spectrogram(np.reshape(OnDNC_dat, np.size(OnDNC_dat)), 1 / (5 * self.Timestep))
-        lfOnDNC = np.log10(fOnDNC[1:])
+        SOnDNC = SOnDNC / np.amax(SOnDNC)
         maxOnDNC = np.amax(SOnDNC)
         minOnDNC = np.amin(SOnDNC)
         maxOnDNC = np.amax(SOnDNC) / 250
-        tOnDNC = 2 * tOnDNC[1:] / 10
+        tOnDNC = 2 * tOnDNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOnDNC, lfOnDNC, SOnDNC[1:, 1:], vmin = minOnDNC, vmax = maxOnDNC, cmap='coolwarm')
-        plt.yticks(lfOnDNC[::20], np.around(fOnDNC[1::20]))
+        plt.pcolormesh(tOnDNC, fOnDNC, SOnDNC, vmin = minOnDNC, vmax = maxOnDNC, cmap='coolwarm')
         plt.title('Decision Coalition Channel 1 Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -872,16 +902,15 @@ class World(Time):
         
         # OffDNC
         fOffDNC, tOffDNC, SOffDNC = spectrogram(np.reshape(OffDNC_dat, np.size(OffDNC_dat)), 1 / (5 * self.Timestep))
-        lfOffNC = np.log10(fOffNC[1:])
+        SOffDNC = SOffDNC / np.amax(SOffDNC)
         maxOffDNC = np.amax(SOffDNC)
         minOffDNC = np.amin(SOffDNC)
-        maxOffDNC = np.amax(SOffDNC) / 250
-        tOffDNC = 2 * tOffDNC[1:] / 10
+        maxOffDNC = np.amax(SOffDNC) / 25
+        tOffDNC = 2 * tOffDNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tOffDNC, lfOffDNC, SOffDNC[1:, 1:], vmin = minOffDNC, vmax = maxOffDNC, cmap='coolwarm')
-        plt.yticks(lfOffDNC[::20], np.around(fOffDNC[1::20]))
+        plt.pcolormesh(tOffDNC, fOffDNC, SOffDNC, vmin = minOffDNC, vmax = maxOffDNC, cmap='coolwarm')
         plt.title('Decision Coalition Channel 2 Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -891,16 +920,15 @@ class World(Time):
         
         # DNC
         fDNC, tDNC, SDNC = spectrogram(np.reshape(DNC_dat, np.size(DNC_dat)), 1 / (5 * self.Timestep))
-        lfDNC = np.log10(fDNC[1:])
+        SDNC = SDNC / np.amax(SDNC)
         maxDNC = np.amax(SDNC)
         minDNC = np.amin(SDNC)
-        maxDNC = np.amax(SDNC) / 250
-        tDNC = 2 * tDNC[1:] / 10
+        maxDNC = np.amax(SDNC) / 25
+        tDNC = 2 * tDNC / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tDNC, lfDNC, SDNC[1:, 1:], vmin = minDNC, vmax = maxDNC, cmap='coolwarm')
-        plt.yticks(lfDNC[::20], np.around(fDNC[1::20]))
+        plt.pcolormesh(tDNC, fDNC, SDNC, vmin = minDNC, vmax = maxDNC, cmap='coolwarm')
         plt.title('Decision Coalition Channel 3 Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -910,16 +938,15 @@ class World(Time):
         
         # Decision
         fD, tD, SD = spectrogram(np.reshape(OnDNC_dat + OffDNC_dat + DNC_dat, np.size(DNC_dat)), 1 / (5 * self.Timestep))
-        lfD = np.log10(fD[1:])
+        SD = SD / np.amax(SD)
         maxD = np.amax(SD)
         minD = np.amin(SD)
         maxD = np.amax(SD) / 2000
-        tD = 2 * tD[1:] / 10
+        tD = 2 * tD / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tD, lfD, SD[1:, 1:], vmin = minD, vmax = maxD, cmap='coolwarm')
-        plt.yticks(lfD[::20], np.around(fD[1::20]))
+        plt.pcolormesh(tD, fD, SD, vmin = minD, vmax = maxD, cmap='coolwarm')
         plt.title('Decision Coalition Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -929,16 +956,15 @@ class World(Time):
         
         # ENN
         fENN, tENN, SENN = spectrogram(np.reshape(cell_culture.NN_sim.data[cell_culture.OutputProbe], np.size(cell_culture.NN_sim.data[cell_culture.OutputProbe])), 1 / (5 * self.Timestep), mode = 'magnitude')
-        lfENN = np.log10(fENN[1:])
+        SENN = SENN / np.amax(SENN)
         maxENN = np.amax(SENN)
         minENN = np.amin(SENN)
         maxENN = np.amax(SENN) / 25
-        tENN = 2 * tENN[1:] / 10
+        tENN = 2 * tENN / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tENN, lfENN, SENN[1:, 1:], vmin = minENN, vmax = maxENN, cmap='coolwarm')
-        plt.yticks(lfENN[::20], np.around(fENN[1::20]))
+        plt.pcolormesh(tENN, fENN, SENN, vmin = minENN, vmax = maxENN, cmap='coolwarm')
         plt.title('ENN Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -948,16 +974,15 @@ class World(Time):
         
         # Output
         fO, tO, SO = spectrogram(np.reshape(abs(cell_culture.NN_sim.data[cell_culture.OnProbe] - cell_culture.NN_sim.data[cell_culture.OffProbe]) + cell_culture.NN_sim.data[cell_culture.OutputProbe], np.size(cell_culture.NN_sim.data[cell_culture.OutputProbe])), 1 / (5 * self.Timestep), mode = 'magnitude')
-        lfO = np.log10(fO[1:])
+        SO = SO / np.amax(SO)
         maxO = np.amax(SO)
         minO = np.amin(SO)
-        maxO = np.amax(SO) / 12.5
-        tO = 2 * tO[1:] / 10
+        maxO = np.amax(SO) / 25
+        tO = 2 * tO / 10
         
         # Spectrogram
         plt.figure(figsize = (8, 6))
-        plt.pcolormesh(tO, lfO, SO[1:,1:], vmin = minO, vmax = maxO, cmap='coolwarm')
-        plt.yticks(lfD[::20], np.around(fD[1::20]))
+        plt.pcolormesh(tO, fO, SO, vmin = minO, vmax = maxO, cmap='coolwarm')
         plt.title('Output Spectrogram for Voltage', {'fontsize': 20})
         plt.ylabel('Frequency in Hertz [Hz]', {'fontsize': 16})
         plt.xlabel('Time in Seconds [s]', {'fontsize': 16})
@@ -978,10 +1003,7 @@ class World(Time):
         GameMat = GameMat[indexes]
         GameMat = GameMat.T
         AP = GameMat[0, :]
-        ratio = int(50 * np.size(AP) / 1000) # Assess the strategy every 20ms
-        AP = AP[::ratio]
         HPLoss = GameMat[1, :]
-        HPLoss = HPLoss [::ratio]
         EP = 1 - np.linspace(0., 1, np.size(AP)) # The set of all possible cooldown frequencies
         HHFreq = hset.ProbabilityHeatHazard
         EPinSim = 1 - np.linspace(hset.ProbabilityHeatHazard, hset.MaxHeatHazardFrequency, np.size(AP))
@@ -999,55 +1021,56 @@ class World(Time):
         ExpectedFitnessE = np.matmul(StrategyFitnessE, EP.T)
         StrategyGradientE = ExpectedFitnessE * (1 - EP)
         Norm = np.hypot(StrategyGradientE, StrategyGradientCc)
+        ratio = int(50 * np.size(AP) / 1000)
         
         # Applying Von Neuman's MiniMax Theorem
-        lower_limit = np.amax(np.amin(ExpectedPayoff, 1))
+        lower_limit = np.amax(np.amin(ExpectedPayoff, 1)) # convert to list to apply Minimax Theorem
         upper_limit = np.amin(np.amax(ExpectedPayoff, 1))
         
         # HP Loss as a function of strategy 2D
         plt.figure(figsize = (10, 6))
         plt.plot(AP, HPLoss)
-        plt.title('Hit Point Reward as a Function of the Cell Culture Strategy', {'fontsize': 20}, pad = 20)
+        plt.title('Hit Point Loss as a Function of the Cell Culture Strategy', {'fontsize': 20}, pad = 20)
         plt.xlabel('Probability of Activating the Heater', {'fontsize': 16}, labelpad = 20)
-        plt.ylabel('Strategy Outcome in HP Reward', {'fontsize': 16}, labelpad = 20)
+        plt.ylabel('Strategy Outcome in HP Gain or Loss', {'fontsize': 16}, labelpad = 20)
         plt.show()
         
         # HP Loss as a function of strategy 3D
         fig = plt.figure(figsize = (14, 10))
         ax = fig.gca(projection = '3d')
         ax.plot_surface(EPMesh, APMesh, HPLMesh.T)
-        plt.title('Hit Point Reward as a Function of the Cell Culture Strategy', {'fontsize': 20}, pad = 15)
+        plt.title('Hit Point Loss as a Function of the Cell Culture Strategy', {'fontsize': 20}, pad = 15)
         plt.xlabel('Frequency of Environment Cool Down', {'fontsize': 16}, labelpad = 10)
         plt.ylabel('Frequency of Heater Activation', {'fontsize': 16}, labelpad = 10)
-        ax.set_zlabel('Strategy Outcome in HP Reward', fontsize = 16, labelpad = 10)
+        ax.set_zlabel('Strategy Outcome in HP Gain or Loss', fontsize = 16, labelpad = 10)
         plt.show()
         
-        # Expected Payoff as a function of strategy 2D
+        # HP Loss as a function of strategy 2D
         plt.figure(figsize = (10, 6))
         plt.plot(AP, np.flip(ExpectedPayoff[CDFIndex, :]))
         plt.title('Expected Payoff as a Function of the Cell Culture Strategy', {'fontsize': 20})
         plt.xlabel('Frequency of Heater Activation', {'fontsize': 16})
-        plt.ylabel('Strategy Expected Payoff in HP Reward', {'fontsize': 16})
+        plt.ylabel('Strategy Outcome in HP Gain or Loss', {'fontsize': 16})
         plt.show()
         
-        # Expected Payoff as a function of strategy 3D
+        # HP Loss as a function of strategy 3D
         fig = plt.figure(figsize = (14, 10))
         ax = fig.gca(projection = '3d')
         ax.plot_surface(EPMesh, APMesh, ExpectedPayoff)
         plt.title('Expected Payoff as a Function of the Cell Culture Strategy', {'fontsize': 20}, pad = 15)
         plt.xlabel('Frequency of Environment Cool Down', {'fontsize': 16}, labelpad = 10)
         plt.ylabel('Frequency of Heater Activation', {'fontsize': 16}, labelpad = 10)
-        ax.set_zlabel('Strategy Expected Payoff in HP Reward', fontsize = 16, labelpad = 10)
+        ax.set_zlabel('Heater Activation Frequency', fontsize = 16, labelpad = 10)
         plt.show()
         
         fig, ax = plt.subplots(figsize = (12, 8))
-        ax.quiver(EPMesh, APMesh, StrategyGradientE, StrategyGradientCc, Norm)
+        ax.quiver(EPMesh[::ratio, ::ratio], APMesh[::ratio, ::ratio], StrategyGradientE[::ratio], StrategyGradientCc[::ratio], Norm[::ratio])
         ax.scatter(EPMesh[::ratio, ::ratio], APMesh[::ratio, ::ratio], color='0.5', s=1)
         plt.plot(1 - EP, AP, label = 'Cell Culture Strategy')
-        plt.plot(np.flip(EPinSim), AP, label = 'Environment Strategy')
+        plt.plot(EPinSim, AP, label = 'Environment Strategy')
         plt.title('Strategy Phase Plane', {'fontsize': 20})
         plt.xlabel('Frequency of Environment Cool Down', {'fontsize': 16})
-        plt.ylabel('Frequency of Heater Activation', {'fontsize': 16})
+        plt.ylabel('Heater Activation Frequency', {'fontsize': 16})
         plt.legend(loc = 3, prop={'size': 12})
         plt.show()
         
@@ -1058,17 +1081,17 @@ class World(Time):
         if lower_limit == upper_limit:
             
             minFreqA = round(np.amax(AP), 3)
-            minFreqH = round(1 - CDF, 3)
-            print("The value of the game is a Nash Equilibrium and is: (", minFreqA, "; ", minFreqH, "; ", upper_limit, ")")
+            minFreqH = 1 - CDF
+            print("The value of the game is a Nash Equilibrium and is: (", minFreqA,",", minFreqH,",", upper_limit, ")")
         
         else:
             
             minFreqA = round(np.amin(AP), 3)
-            minFreqH = round(1 - CDF, 3)
+            minFreqH = 1 - CDF
             maxFreqA = round(np.amax(AP), 3)
-            maxFreqH = round(1 - CDF, 3)
-            print("The lower limit of the game is: (", maxFreqA,"; ", maxFreqH, "; ", lower_limit, ")")
-            print("The upper limit of the game is: (", minFreqA,"; ", minFreqH, "; ", upper_limit, ")")
+            maxFreqH = 1 - CDF
+            print("The lower limit of the game is: (", maxFreqA,",", maxFreqH, ",", lower_limit, ")")
+            print("The upper limit of the game is: (", minFreqA,",", minFreqH, ",", upper_limit, ")")
         
         print('End of game analysis')
     
@@ -1081,6 +1104,7 @@ class World(Time):
         with cell_culture.NN_sim:
             
             # heater.activate()
+            nb_activations = 0
             
             for i in range(0, nb_timesteps):
                 
@@ -1096,7 +1120,7 @@ class World(Time):
                     
                     break
                 
-                self.update(cell_culture, heater, i, hset)
+                self.update(cell_culture, heater, i, hset, nb_activations)
                 
         self.display_all_experimental_variables(cell_culture, heater, hset) #, frequencies, time_of_experiment, nb_timesteps)
 
@@ -1123,20 +1147,24 @@ if __name__ == "__main__":
     cc_position_x = 0
     cc_position_y = 0
     cc_position_z = 0.1
-    cc_hp = 60000
+    cc_hp = 50000
+    cc_mass = 0.2
+    cc_heat_capacity = 800
     
     # Neural Network Parameters
-    nb_afferent_neurons = 40
-    nb_turnon_neurons = 30
-    nb_turnoff_neurons = 30
-    nb_decision_neurons = 140
-    nb_efferent_neurons = 40
+    nb_afferent_neurons = 50
+    nb_turnon_neurons = 40
+    nb_turnoff_neurons = 40
+    nb_decision_neurons = 200
+    nb_efferent_neurons = 50
     
     cc = CellCulture(initial_temperature,
                      initial_time,
                      cc_diameter,
                      cc_height,
                      cc_conduction,
+                     cc_mass,
+                     cc_heat_capacity,
                      cc_position_x,
                      cc_position_y,
                      cc_position_z,
@@ -1158,6 +1186,7 @@ if __name__ == "__main__":
     heater_position_x = 0
     heater_position_y = 0
     heater_position_z = 0
+    heater_mass = 0.5
     
     h = OnOffHeater(heater_power,
                heater_length,
@@ -1166,15 +1195,16 @@ if __name__ == "__main__":
                heater_position_x,
                heater_position_y,
                heater_position_z,
-               initial_temperature)
+               initial_temperature,
+               heater_mass)
     
     h.label_heater('Heater')
     
     # Parameters of the world
     initial_temperature = 20   # 20 C is Ambient temperature
-    length = 20
-    width = 20
-    height = 20
+    length = 2
+    width = 2
+    height = 2
     
     
     # Create the world
@@ -1183,8 +1213,8 @@ if __name__ == "__main__":
     w1.add_object(cc)
     
     # Experiment Parameters
-    time_of_experiment = 80. # eighty seconds
-    nb_hazards = int(time_of_experiment / 8.) # One hazard for 10, 5, 2, 1 seconds
+    time_of_experiment = 15 # eighty seconds
+    nb_hazards = int(time_of_experiment / 5.) # One hazard for 10, 5, 2, 1 seconds
     print("There will be ", nb_hazards, "hazards in this experiment")
     
     # Plan hazards
